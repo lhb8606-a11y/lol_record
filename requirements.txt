@@ -1,4 +1,6 @@
 streamlit
 pandas
 pillow
-google-cloud-vision
+easyocr
+opencv-python-headless
+numpy
