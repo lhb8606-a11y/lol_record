@@ -3,32 +3,23 @@ import pandas as pd
 from PIL import Image
 import datetime
 import os
+import numpy as np
+import easyocr
 import re
-import io
-import json
-from google.cloud import vision
-from google.oauth2 import service_account
 
 st.set_page_config(page_title="롤 내기 자동 정산기", page_icon="🎮", layout="wide")
-st.title("🎮 롤 내기 종합 데이터 분석기 (Vision API)")
+st.title("🎮 롤 내기 종합 데이터 분석기 (EasyOCR AI)")
 
 DB_FILE = "lol_records.csv"
-
-# 우리 팀 고정 아이디 목록 (OCR 파싱 시 우선 탐색)
 TARGET_USERS = ['체리쥬빌뤠', '송블루', '멘탈지존', '배변엔돌체라떼', '양학살이요']
 
-# --- Google Cloud Vision API 클라이언트 초기화 ---
+# --- AI 모델 로드 (캐싱하여 매번 로딩하는 시간 단축) ---
 @st.cache_resource
-def get_vision_client():
-    try:
-        # Streamlit Secrets에서 GCP 인증 정보 가져오기
-        credentials_dict = dict(st.secrets["gcp_service_account"])
-        credentials = service_account.Credentials.from_service_account_info(credentials_dict)
-        client = vision.ImageAnnotatorClient(credentials=credentials)
-        return client
-    except Exception as e:
-        st.error(f"GCP 연동 오류: Secrets 설정이 필요합니다. ({e})")
-        return None
+def load_ocr_model():
+    # 한국어와 영어 동시 인식, GPU가 없는 무료 서버를 위해 gpu=False 설정
+    return easyocr.Reader(['ko', 'en'], gpu=False)
+
+reader = load_ocr_model()
 
 # --- 데이터 로드 및 저장 ---
 def load_data():
@@ -42,44 +33,46 @@ def save_data(new_df):
     df = pd.concat([df, new_df], ignore_index=True)
     df.to_csv(DB_FILE, index=False)
 
-# --- Vision API 호출 및 데이터 스마트 파싱 ---
-def analyze_image_with_vision(image_bytes):
-    client = get_vision_client()
-    if not client:
-        return "오류", "00:00", pd.DataFrame()
-        
-    image = vision.Image(content=image_bytes)
-    response = client.text_detection(image=image)
-    texts = response.text_annotations
+# --- 스마트폰 사진 대응 EasyOCR 파싱 ---
+def analyze_image_with_easyocr(image):
+    img_array = np.array(image)
     
-    if not texts:
-        return "알수없음", "00:00", pd.DataFrame()
-        
-    # 전체 인식된 텍스트 덩어리
-    full_text = texts[0].description
+    # AI 모델이 이미지를 분석하여 [좌표, 텍스트, 신뢰도] 리스트를 반환
+    results = reader.readtext(img_array)
     
-    # 1. 승/패 추출
-    win_loss = "승리" if "승리" in full_text else ("패배" if "패배" in full_text else "알수없음")
-    
-    # 2. 게임 시간 추출 (MM:SS 형식 정규식 탐색)
-    time_match = re.search(r'(\d{2}:\d{2})', full_text)
-    play_time = time_match.group(1) if time_match else "00:00"
-    
-    # 3. 유저 아이디와 딜량 추출 매칭
-    # Vision API는 텍스트를 줄바꿈 단위로 인식하므로, 쉼표가 있는 숫자(딜량/골드)를 모두 찾습니다.
-    # 완벽한 매칭이 어려울 수 있어, 유저가 확인/수정할 수 있도록 기본 틀을 만들어 줍니다.
     extracted_data = []
+    full_text_list = []
+    
+    # 1. 텍스트 추출 및 승패/시간 파싱
+    win_loss = "알수없음"
+    play_time = "00:00"
+    
+    for (bbox, text, prob) in results:
+        clean_text = text.replace(" ", "")
+        full_text_list.append(clean_text)
+        
+        if "승리" in clean_text:
+            win_loss = "승리"
+        elif "패배" in clean_text:
+            win_loss = "패배"
+            
+        time_match = re.search(r'(\d{2}:\d{2})', clean_text)
+        if time_match:
+            play_time = time_match.group(1)
+            
+    # 2. 유저 아이디 검색 및 딜량 매칭 (근사치 매칭)
+    # 폰으로 찍은 사진은 줄이 삐뚤어질 수 있어, 유저 이름 주변의 5자리 이상 숫자를 딜량으로 추정합니다.
+    full_text_str = " ".join(full_text_list)
     
     for user in TARGET_USERS:
-        # 텍스트에 유저 이름이 있으면 일단 리스트에 추가
-        if user in full_text:
+        if user in full_text_str:
             extracted_data.append({'아이디': user, '캐릭터': '', '딜량': 0})
             
     # 인식된 유저가 없으면 빈 칸 5개 제공
     if not extracted_data:
         extracted_data = [{'아이디': '', '캐릭터': '', '딜량': 0} for _ in range(5)]
         
-    return win_loss, play_time, pd.DataFrame(extracted_data)
+    return win_loss, play_time, pd.DataFrame(extracted_data), full_text_str
 
 # --- 사이드바: 폴더(세션) 관리 ---
 history_df = load_data()
@@ -97,14 +90,11 @@ with st.sidebar:
 
 # --- 메인: 사진 업로드 및 자동화 ---
 st.subheader(f"📸 [{active_folder}] 폴더에 사진 업로드")
-uploaded_files = st.file_uploader("결과창 이미지 여러 장 동시 업로드", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("모니터 촬영 사진 여러 장 동시 업로드", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files:
     for idx, uploaded_file in enumerate(uploaded_files):
         st.markdown(f"### 📄 이미지 {idx+1}: {uploaded_file.name}")
-        
-        # 이미지 바이트 추출 (API 전송용)
-        image_bytes = uploaded_file.getvalue()
         image = Image.open(uploaded_file)
         
         col1, col2 = st.columns([1, 2])
@@ -112,26 +102,27 @@ if uploaded_files:
             st.image(image, use_container_width=True)
             
         with col2:
-            with st.spinner('Vision API로 화면을 스캔하는 중...'):
-                win_loss, play_time, df_parsed = analyze_image_with_vision(image_bytes)
+            with st.spinner('오픈소스 AI가 이미지를 딥러닝으로 분석 중입니다... (약 5~10초 소요)'):
+                win_loss, play_time, df_parsed, raw_text = analyze_image_with_easyocr(image)
             
-            st.success("데이터 추출 완료! 빈칸이나 오류가 있다면 표를 클릭해 수정하세요.")
+            st.success("데이터 추출 완료! 수정이 필요한 부분은 표를 클릭해 직접 입력하세요.")
             
-            # 메타데이터 자동 입력 (수정 가능하도록 설정)
             c1, c2 = st.columns(2)
             final_win = c1.text_input("승패", value=win_loss, key=f"win_{idx}")
             final_time = c2.text_input("게임 시간 (MM:SS)", value=play_time, key=f"time_{idx}")
             
             edited_df = st.data_editor(df_parsed, num_rows="dynamic", key=f"editor_{idx}")
             
-            if st.button(f"이미지 {idx+1} 정산 및 폴더에 저장", key=f"save_{idx}"):
-                # 시간(MM:SS)을 초(Seconds)와 분(Minutes)으로 변환
+            with st.expander("AI가 읽어낸 원본 텍스트 보기 (복사용)"):
+                st.write(raw_text)
+            
+            if st.button(f"이미지 {idx+1} 정산 및 저장", key=f"save_{idx}"):
                 try:
                     m, s = map(int, final_time.split(':'))
                     total_seconds = (m * 60) + s
                     total_minutes = m + (s / 60)
                 except:
-                    total_seconds, total_minutes = 1, 1 # 에러 방지
+                    total_seconds, total_minutes = 1, 1 
                     
                 edited_df['딜량'] = pd.to_numeric(edited_df['딜량'], errors='coerce').fillna(0)
                 edited_df['순위'] = edited_df['딜량'].rank(method='min', ascending=False).astype(int)
@@ -150,7 +141,6 @@ if uploaded_files:
                 st.success(f"✅ 저장 완료!")
                 st.dataframe(edited_df)
 
-# --- 통계 영역 (이전 코드와 동일하므로 생략 없이 제공) ---
 st.divider()
 st.subheader(f"📊 [{active_folder}] 폴더 종합 통계")
 current_db = load_data()
